@@ -5,8 +5,9 @@ import numpy as np
 import torch
 import cv2
 from scipy import ndimage
-from scipy.ndimage.interpolation import zoom
+from scipy.ndimage import zoom
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 def random_rot_flip(image, label):
@@ -97,4 +98,57 @@ class Synapse_dataset(Dataset):
         if self.transform:
             sample = self.transform(sample)
         sample['case_name'] = self.sample_list[idx].strip('\n')
+        return sample
+
+
+class Synapse_preloaded_dataset(Dataset):
+    def __init__(self, base_dir, list_dir, split, nclass=9,transform=None):
+        self.transform = transform  
+        split = split
+        sample_list = open(os.path.join(list_dir, split+'.txt')).readlines()
+        data_dir = base_dir
+        nclass = nclass
+
+        # preload everything into RAM
+        self.data_cache = []
+        for line in tqdm(sample_list, desc=f'Preloading {split} data', unit='sample'):
+            case_name = line.strip('\n')
+            if split == "train":
+                data_path = os.path.join(data_dir, case_name + '.npz')
+                data = np.load(data_path)
+                image, label = data['image'], data['label']
+            else:
+                filepath = data_dir + "/{}.npy.h5".format(case_name)
+                with h5py.File(filepath, 'r') as data:
+                    image, label = data['image'][:], data['label'][:]
+
+            # make copies so nothing stays memory-mapped / tied to a closed file handle
+            image = np.array(image)
+            label = np.array(label)
+
+            if nclass == 9:
+                label[label == 5] = 0
+                label[label == 9] = 0
+                label[label == 10] = 0
+                label[label == 12] = 0
+                label[label == 13] = 0
+                label[label == 11] = 5
+
+            self.data_cache.append({
+                'image': image,
+                'label': label,
+                'case_name': case_name
+            })
+
+    def __len__(self):
+        return len(sample_list)
+
+    def __getitem__(self, idx):
+        cached = self.data_cache[idx]
+        sample = {'image': cached['image'], 'label': cached['label']}
+
+        if self.transform:
+            sample = self.transform(sample)
+
+        sample['case_name'] = cached['case_name']
         return sample
