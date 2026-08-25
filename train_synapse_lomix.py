@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
-from lib.networks import PVT_CASCADE, EMCADNet
+from lib.networks import EMCADNet
 from trainer import trainer_synapse
 
 parser = argparse.ArgumentParser()
@@ -133,7 +133,6 @@ if __name__ == "__main__":
     
     print(snapshot_path)
     model = EMCADNet(num_classes=args.num_classes, kernel_sizes=args.kernel_sizes, expansion_factor=args.expansion_factor, dw_parallel=not args.no_dw_parallel, add=not args.concatenation, lgag_ks=args.lgag_ks, activation=args.activation_mscb, encoder=args.encoder, pretrain= not args.no_pretrain)
-    #model = PVT_CASCADE(n_class=args.num_classes, encoder=args.encoder, pretrain=not args.no_pretrain, head='Conv2D', bbox=False, cds=False)
     
     model.cuda()
 
