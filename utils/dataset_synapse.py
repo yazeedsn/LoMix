@@ -141,7 +141,7 @@ class Synapse_preloaded_dataset(Dataset):
             })
 
     def __len__(self):
-        return len(sample_list)
+        return len(self.data_cache)
 
     def __getitem__(self, idx):
         cached = self.data_cache[idx]
