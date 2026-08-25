@@ -329,7 +329,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     iterator = tqdm(range(max_epoch), ncols=70)
 
     for epoch_num in iterator:
-        for i_batch, sampled_batch in enumerate(trainloader):
+        epoch_bar = tqdm(trainloader, desc=f'Epoch {epoch_num}', leave=False, ncols=100)
+        for i_batch, sampled_batch in enumerate(epoch_bar):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             # FIX: non_blocking=True lets the H2D copy overlap with compute
             # when paired with pin_memory=True on the DataLoader.
@@ -361,6 +362,12 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                 param_group['lr'] = lr_
 
             iter_num += 1
+            epoch_bar.set_postfix({
+                'loss': f"{loss.item() if isinstance(loss, torch.Tensor) else loss:.4f}",
+                'ds': f"{deep_supervision_loss.item() if isinstance(deep_supervision_loss, torch.Tensor) else deep_supervision_loss:.4f}",
+                'mut': f"{mutation_loss.item() if isinstance(mutation_loss, torch.Tensor) else mutation_loss:.4f}",
+                'lr': f"{lr_:.2e}",
+            })
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
