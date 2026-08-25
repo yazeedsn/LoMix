@@ -297,9 +297,9 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if torch.cuda.device_count() > 1:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
-        model = nn.DataParallel(model)
+    #if torch.cuda.device_count() > 1:
+        #print("Let's use", torch.cuda.device_count(), "GPUs!")
+        #model = nn.DataParallel(model)
     model.to(device)
 
     model.train()
