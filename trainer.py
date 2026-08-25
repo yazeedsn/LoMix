@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torch.cuda.amp import GradScaler, autocast
 
-from utils.dataset_synapse import Synapse_dataset, RandomGenerator
+from utils.dataset_synapse import Synapse_dataset, Synapse_preloaded_dataset, RandomGenerator
 from utils.utils import powerset#, cal_params_flops
 from utils.utils import one_hot_encoder
 from utils.utils import DiceLoss
@@ -260,6 +260,7 @@ class CombinatorialMutationsLossModule(nn.Module):
 
 def inference(args, model, best_performance):
     db_test = Synapse_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir, nclass=args.num_classes)
+    db_test = Synapse_preloaded_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir, nclass=args.num_classes)
     
     testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     logging.info("{} test iterations per epoch".format(len(testloader)))
@@ -287,6 +288,10 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     
     
     db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train", nclass=args.num_classes,
+                               transform=transforms.Compose(
+                                   [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+
+    db_train = Synapse_preloaded_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train", nclass=args.num_classes,
                                transform=transforms.Compose(
                                    [RandomGenerator(output_size=[args.img_size, args.img_size])]))
     print("The length of train set is: {}".format(len(db_train)))
