@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
-from lib.networks import EMCADNet
+from lib.networks import PVT_CASCADE, EMCADNet
 from trainer import trainer_synapse
 
 parser = argparse.ArgumentParser()
@@ -47,12 +47,13 @@ parser.add_argument('--max_iterations', type=int,
 parser.add_argument('--max_epochs', type=int,
                     default=300, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int,
-                    default=6, help='batch_size per gpu')
+                    default=6, help='batch_size PER GPU (effective global batch size = batch_size * world_size under DDP)')
 parser.add_argument('--base_lr', type=float,  default=0.0001,
                     help='segmentation network learning rate')
 parser.add_argument('--img_size', type=int,
                     default=224, help='input patch size of network input')
-parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
+parser.add_argument('--n_gpu', type=int, default=1, help='total gpu (kept for snapshot-path naming; actual '
+                    'world size for DDP comes from torchrun, not this flag)')
 parser.add_argument('--deterministic', type=int,  default=1,
                     help='whether use deterministic training')
 parser.add_argument('--seed', type=int,
@@ -114,9 +115,7 @@ if __name__ == "__main__":
     else:
         learnable = ''
     run = 1
-    #args.exp = args.encoder + '_CASCADE_loss_'+learnable+'relative_softp_' + args.supervision + '_'+str(operations)+'_output_last_layer_Run'+str(run)+'_' + dataset_name + str(args.img_size)+'_nclass_'+str(args.num_classes) #add_sub_multiply_concat #_final_layer
     args.exp = args.encoder + '_EMCADNet_kernel_sizes_' + str(args.kernel_sizes) + '_dw_' + dw_mode + '_' + aggregation + '_lgag_ks_' + str(args.lgag_ks) + '_act_mscb_' + args.activation_mscb + '_loss_'+learnable+'relative_softp_' + args.supervision + '_'+str(operations)+'_output_last_layer_Run'+str(run)+'_' + dataset_name + str(args.img_size)#+'_nclass_'+str(args.num_classes) #add_sub_multiply_concat #_final_layer
-    #snapshot_path = "model_pth/{}/{}".format(args.exp, args.encoder + '_loss_'+learnable+'relative_softp_' + args.supervision + '_'+str(operations)+'_output_last_layer_Run'+str(run)) #add_sub_multiply_concat #_final_layer
     snapshot_path = "model_pth/{}/{}".format(args.exp, args.encoder + '_EMCADNet_kernel_sizes_' + str(args.kernel_sizes) + '_dw_' + dw_mode + '_' + aggregation + '_lgag_ks_' + str(args.lgag_ks) + '_act_mscb_' + args.activation_mscb + '_loss_'+learnable+'relative_softp_' + args.supervision + '_'+str(operations)+'_output_last_layer_Run'+str(run)) #add_sub_multiply_concat #_final_layer
     snapshot_path = snapshot_path.replace('[', '').replace(']', '').replace(', ', '_')
     
@@ -128,15 +127,28 @@ if __name__ == "__main__":
     snapshot_path = snapshot_path + '_'+str(args.img_size)
     snapshot_path = snapshot_path + '_s'+str(args.seed) if args.seed!=1234 else snapshot_path
 
-    if not os.path.exists(snapshot_path):
+    # FIX: only rank 0 needs to create the snapshot directory. Under torchrun,
+    # every process runs this whole script, so guard directory creation (and
+    # the "Model successfully created." print) by local rank to avoid a race
+    # on os.makedirs and duplicated console spam from every GPU process.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank == 0 and not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
-    
-    print(snapshot_path)
-    model = EMCADNet(num_classes=args.num_classes, kernel_sizes=args.kernel_sizes, expansion_factor=args.expansion_factor, dw_parallel=not args.no_dw_parallel, add=not args.concatenation, lgag_ks=args.lgag_ks, activation=args.activation_mscb, encoder=args.encoder, pretrain= not args.no_pretrain)
-    
-    model.cuda()
 
-    print('Model successfully created.')
+    if local_rank == 0:
+        print(snapshot_path)
+
+    model = EMCADNet(num_classes=args.num_classes, kernel_sizes=args.kernel_sizes, expansion_factor=args.expansion_factor, dw_parallel=not args.no_dw_parallel, add=not args.concatenation, lgag_ks=args.lgag_ks, activation=args.activation_mscb, encoder=args.encoder, pretrain= not args.no_pretrain)
+
+    # FIX: no model.cuda() here anymore. Under DDP each process needs the
+    # model placed on ITS OWN local-rank GPU (cuda:LOCAL_RANK), which is only
+    # known once trainer_synapse() calls setup_distributed(). Calling
+    # model.cuda() here would put every process's model on cuda:0 before that
+    # rank info even exists. trainer_synapse() now handles device placement
+    # (and DDP wrapping) internally.
+
+    if local_rank == 0:
+        print('Model successfully created.')
     
     trainer = {'Synapse': trainer_synapse,}
     trainer[dataset_name](args, model, snapshot_path, supervision=args.supervision, operations=operations, use_learnable_weights=use_learnable_weights)
