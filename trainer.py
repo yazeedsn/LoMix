@@ -486,7 +486,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         shuffle = True
 
     trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=shuffle, sampler=train_sampler,
-                              num_workers=8, pin_memory=True, worker_init_fn=worker_init_fn,
+                              num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn,
                               persistent_workers=True, prefetch_factor=4, drop_last=is_distributed)
 
     # Validation set / loader: only rank 0 actually needs it (see inference()),
