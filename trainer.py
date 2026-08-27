@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torch.cuda.amp import GradScaler, autocast
 
-from utils.dataset_synapse import Synapse_preloaded_dataset, RandomGenerator
+from utils.dataset_synapse import Synapse_preloaded_dataset, Synapse_dataset, RandomGenerator
 from utils.utils import powerset  # , cal_params_flops
 from utils.utils import one_hot_encoder
 from utils.utils import DiceLoss
@@ -490,7 +490,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     # but build it on all ranks cheaply guarded by rank to avoid every process
     # preloading the volumes into RAM redundantly.
     if is_main_process(rank):
-        db_test = Synapse_preloaded_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir,
+        db_test = Synapse_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir,
                                              nclass=args.num_classes)
         testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     else:
