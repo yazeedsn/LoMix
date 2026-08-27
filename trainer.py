@@ -5,7 +5,6 @@ import random
 import sys
 import time
 import numpy as np
-from tqdm import tqdm
 from itertools import combinations
 
 import torch
@@ -425,7 +424,7 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
     logging.info("{} test iterations per epoch".format(len(testloader)))
     model.eval()
     metric_list = 0.0
-    for i_batch, sampled_batch in enumerate(tqdm(testloader, desc='inference', leave=False)):
+    for i_batch, sampled_batch in enumerate(testloader):
         h, w = sampled_batch["image"].size()[2:]
         image, label = sampled_batch["image"], sampled_batch["label"]
         case_name = sampled_batch['case_name'][0]
@@ -445,8 +444,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     rank, local_rank, world_size, is_distributed = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    # FIX: only rank 0 sets up file logging / prints, so log lines and tqdm
-    # bars aren't duplicated once per GPU.
     if is_main_process(rank):
         logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                              format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
@@ -535,19 +532,14 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     if is_main_process(rank):
         logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
-    iterator = tqdm(range(max_epoch), ncols=70) if is_main_process(rank) else range(max_epoch)
+    iterator = range(max_epoch)
 
     for epoch_num in iterator:
         if is_distributed:
             train_sampler.set_epoch(epoch_num)
 
-        # FIX: mininterval throttles how often tqdm redraws based on elapsed
-        # time, which matters once the vectorized loss below speeds up
-        # iterations — without it, a fast loop would try to redraw (and, in
-        # non-tty/captured output, print a new line) far more often than a
-        # human needs to see.
-        epoch_bar = tqdm(trainloader, desc=f'Epoch {epoch_num}', leave=False, ncols=100, mininterval=1.0) \
-            if is_main_process(rank) else trainloader
+
+        epoch_bar = trainloader
 
         for i_batch, sampled_batch in enumerate(epoch_bar):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
@@ -570,14 +562,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             iter_num += 1
 
             if is_main_process(rank):
-                # FIX: refresh=False stops set_postfix from forcing an extra,
-                # immediate redraw on top of tqdm's normal per-iteration
-                # update. That forced redraw was invisible in a real
-                # terminal (it just repainted the same \r-line) but in
-                # Kaggle's captured, non-tty output each redraw became its
-                # own permanent line — the "doubled" lines per iteration you
-                # were seeing. With refresh=False, tqdm still shows the
-                # postfix, just as part of its single normal update.
                 epoch_bar.set_postfix({
                     'loss': f"{loss.item():.4f}",
                     'ds': f"{deep_supervision_loss.item():.4f}",
