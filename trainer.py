@@ -539,9 +539,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             train_sampler.set_epoch(epoch_num)
 
 
-        epoch_bar = trainloader
 
-        for i_batch, sampled_batch in enumerate(epoch_bar):
+        for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch = image_batch.to(device, non_blocking=True)
             label_batch = label_batch.squeeze(1).to(device, non_blocking=True)
@@ -562,12 +561,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             iter_num += 1
 
             if is_main_process(rank):
-                epoch_bar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'ds': f"{deep_supervision_loss.item():.4f}",
-                    'mut': f"{mutation_loss.item():.4f}",
-                    'lr': f"{lr_:.2e}",
-                }, refresh=False)
                 writer.add_scalar('info/lr', lr_, iter_num)
                 writer.add_scalar('info/total_loss', loss, iter_num)
                 writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
