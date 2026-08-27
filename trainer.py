@@ -467,7 +467,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
 
     if is_distributed:
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=False, gradient_as_bucket_view=True)
+                        find_unused_parameters=False, gradient_as_bucket_view=False)
         raw = combined.module
     else:
         raw = combined
