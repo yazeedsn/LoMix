@@ -382,7 +382,16 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
 
 
 def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=['add', 'mul', 'wf', 'concat'],
-                     n_outs=4, use_learnable_weights=True):
+                     n_outs=4, use_learnable_weights=True, patience=30, min_delta=0.0):
+    """
+    patience: number of consecutive epochs with no validation mean_dice
+        improvement (> min_delta) before training stops early. Set to a
+        value >= args.max_epochs (or None-like large number) to effectively
+        disable early stopping.
+    min_delta: minimum increase in mean_dice to count as an "improvement"
+        for early-stopping purposes (does not affect checkpoint-saving,
+        which still saves on any performance >= best_performance as before).
+    """
     rank, local_rank, world_size, is_distributed = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
@@ -392,6 +401,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
         logging.info(str(args))
         logging.info(f"Distributed: {is_distributed}, world_size: {world_size}")
+        logging.info(f"Early stopping patience: {patience}, min_delta: {min_delta}")
     else:
         logging.basicConfig(level=logging.CRITICAL)
 
@@ -457,17 +467,35 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     max_iterations = args.max_epochs * len(trainloader)
     if is_main_process(rank):
         logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
+
+    # LR SCHEDULER: polynomial decay, the standard policy for this codebase
+    # family (TransUNet/CASCADE/EMCAD-derived). Previously the training loop
+    # set `lr_ = base_lr` unconditionally every iteration — a no-op that
+    # never actually decayed the learning rate. LambdaLR now handles this
+    # via scheduler.step() called once per iteration in the training loop.
+    scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda it: (1.0 - it / max_iterations) ** 0.9
+    )
+
     best_performance = 0.0
+    epochs_no_improve = 0  # EARLY STOPPING: consecutive epochs with no val improvement
     iterator = tqdm(range(max_epoch), ncols=70) if is_main_process(rank) else range(max_epoch)
 
     for epoch_num in iterator:
         if is_distributed:
             train_sampler.set_epoch(epoch_num)
 
-        epoch_bar = tqdm(trainloader, desc=f'Epoch {epoch_num}', leave=False, ncols=100, mininterval=1.0) \
-            if is_main_process(rank) else trainloader
-
-        for i_batch, sampled_batch in enumerate(epoch_bar):
+        # FIX: dropped the per-batch tqdm bar. In a real terminal it
+        # redraws the SAME line via '\r', but Kaggle's captured (non-tty)
+        # output can't do that — every throttled refresh became its own
+        # permanent printed line, flooding the log once training got fast
+        # (~2.5s/it means a new line roughly every second even at
+        # mininterval=1.0). Iterating trainloader directly avoids that
+        # entirely; live loss values are now shown on the OUTER per-epoch
+        # bar's postfix instead (see below), which only advances once per
+        # epoch by construction — so in this same non-tty fallback mode it
+        # naturally prints exactly one new line per epoch.
+        for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch = image_batch.to(device, non_blocking=True)
             label_batch = label_batch.squeeze(1).to(device, non_blocking=True)
@@ -481,19 +509,16 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             scaler.step(optimizer)
             scaler.update()
 
-            lr_ = base_lr
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr_
+            # LR SCHEDULER: standard polynomial decay (this codebase's usual
+            # "poly" policy) stepped once per iteration via a real
+            # LambdaLR scheduler, instead of the previous dead
+            # `lr_ = base_lr` (which never actually decayed).
+            scheduler.step()
+            lr_ = optimizer.param_groups[0]['lr']
 
             iter_num += 1
 
             if is_main_process(rank):
-                epoch_bar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'ds': f"{deep_supervision_loss.item():.4f}",
-                    'mut': f"{mutation_loss.item():.4f}",
-                    'lr': f"{lr_:.2e}",
-                }, refresh=False)
                 writer.add_scalar('info/lr', lr_, iter_num)
                 writer.add_scalar('info/total_loss', loss, iter_num)
                 writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
@@ -506,6 +531,17 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                             mutation_loss.item(), lr_))
 
         if is_main_process(rank):
+            # Update the OUTER epoch bar's postfix with the last batch's
+            # loss values. Since this bar advances once per epoch (not per
+            # batch), this is the only per-epoch redraw — exactly one new
+            # line per epoch in non-tty output, none per batch.
+            if hasattr(iterator, 'set_postfix'):
+                iterator.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'ds': f"{deep_supervision_loss.item():.4f}",
+                    'mut': f"{mutation_loss.item():.4f}",
+                    'lr': f"{lr_:.2e}",
+                }, refresh=False)
             logging.info(
                 'iteration %d, epoch %d : loss : %f, deep_supervision_loss : %f, mutation_loss : %f, lr: %f' % (
                     iter_num, epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
@@ -521,6 +557,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             dist.barrier()
 
         performance = inference(args, raw.model, best_performance, db_test, testloader, device, rank)
+        prev_best = best_performance  # captured before checkpoint block below updates it, for early-stopping comparison
 
         if is_main_process(rank):
             save_interval = 50
@@ -541,6 +578,37 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
 
         if is_distributed:
             dist.barrier()
+
+        # EARLY STOPPING: only rank 0 has a real `performance`/`prev_best`
+        # (inference() is a no-op on other ranks), so the stop decision is
+        # made on rank 0 and then broadcast to every rank. This is required
+        # under DDP — if rank 0 alone decided to `break` while other ranks
+        # kept looping, they'd call combined()'s forward/backward next epoch
+        # expecting a gradient all-reduce from rank 0 that would never come,
+        # hanging forever.
+        stop_flag = 0
+        if is_main_process(rank):
+            if performance > prev_best + min_delta:
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                logging.info(f"No improvement in mean_dice for {epochs_no_improve} epoch(s) (patience={patience}).")
+            if epochs_no_improve >= patience:
+                stop_flag = 1
+                logging.info(f"Early stopping triggered at epoch {epoch_num}: "
+                              f"no mean_dice improvement for {patience} consecutive epochs.")
+                print(f"[EARLY STOP] No mean_dice improvement for {patience} epochs. "
+                      f"Stopping at epoch {epoch_num} (best mean_dice: {best_performance:.4f}).")
+
+        if is_distributed:
+            stop_tensor = torch.tensor([stop_flag], device=device, dtype=torch.int)
+            dist.broadcast(stop_tensor, src=0)
+            stop_flag = int(stop_tensor.item())
+
+        if stop_flag:
+            if is_main_process(rank) and hasattr(iterator, 'close'):
+                iterator.close()
+            break
 
         if epoch_num >= max_epoch - 1:
             if is_main_process(rank):
