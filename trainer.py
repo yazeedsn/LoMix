@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from utils.dataset_synapse import Synapse_preloaded_dataset, Synapse_dataset, RandomGenerator
 from utils.utils import powerset  # , cal_params_flops
@@ -270,6 +270,7 @@ class CombinatorialMutationsLossModule(nn.Module):
             final_loss = deep_supervision_loss
         return final_loss, deep_supervision_loss, mutation_loss
 
+    @torch.no_grad()
     def print_weights(self):
         if not self.use_learnable_weights:
             logging.info("No learnable weights. Using uniform weighting.")
@@ -346,8 +347,19 @@ def setup_distributed():
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # FIX: set the device BEFORE init, and pass device_id so NCCL knows
+        # which GPU this process owns up front instead of inferring it the
+        # first time a collective (e.g. dist.barrier()) runs. Without this,
+        # PyTorch emits "barrier(): using the device under current context.
+        # You can specify device_id in init_process_group to mute this
+        # warning." on every barrier call. device_id is only accepted by
+        # newer torch versions, so fall back gracefully on older ones.
         torch.cuda.set_device(local_rank)
+        try:
+            dist.init_process_group(backend="nccl", init_method="env://",
+                                     device_id=torch.device(f"cuda:{local_rank}"))
+        except TypeError:
+            dist.init_process_group(backend="nccl", init_method="env://")
         return rank, local_rank, world_size, True
     else:
         return 0, 0, 1, False
@@ -365,7 +377,12 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
     logging.info("{} test iterations per epoch".format(len(testloader)))
     model.eval()
     metric_list = 0.0
-    for i_batch, sampled_batch in enumerate(tqdm(testloader, desc='validation', leave=False)):
+    # FIX: removed the per-volume tqdm bar (same reasoning as the training
+    # loop) — Kaggle's non-tty captured output can't redraw a line in place,
+    # so each throttled refresh became its own permanent printed line. This
+    # now matches training's style: no per-item output, just the single
+    # end-of-run summary line below.
+    for i_batch, sampled_batch in enumerate(testloader):
         h, w = sampled_batch["image"].size()[2:]
         image, label = sampled_batch["image"], sampled_batch["label"]
         case_name = sampled_batch['case_name'][0]
@@ -459,7 +476,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     optimizer = optim.AdamW(combined.parameters(), lr=base_lr, weight_decay=0.0001)
 
     use_amp = device.type == 'cuda'
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler('cuda', enabled=use_amp)
 
     writer = SummaryWriter(snapshot_path + '/log') if is_main_process(rank) else None
     iter_num = 0
@@ -502,18 +519,34 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=use_amp):
+            with autocast('cuda', enabled=use_amp):
                 loss, deep_supervision_loss, mutation_loss = combined(image_batch, label_batch, ce_loss, dice_loss)
 
             scaler.scale(loss).backward()
+            # FIX: track the AMP scale factor before/after scaler.update() so
+            # we know whether scaler.step(optimizer) actually ran
+            # optimizer.step() this iteration. When GradScaler detects an
+            # inf/nan gradient (common in the first several iterations while
+            # it's still calibrating its scale, or any time a batch produces
+            # an overflow), it SKIPS the underlying optimizer.step() and
+            # shrinks the scale instead. Calling scheduler.step() unconditionally
+            # right after would then step the LR schedule for an iteration
+            # where no actual optimizer update happened — which is exactly
+            # what triggered the "lr_scheduler.step() before optimizer.step()"
+            # warning. Comparing scale_before/after is the standard way to
+            # detect a skipped step and only advance the scheduler on
+            # iterations where optimizer.step() genuinely ran.
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            optimizer_stepped = scaler.get_scale() >= scale_before
 
             # LR SCHEDULER: standard polynomial decay (this codebase's usual
             # "poly" policy) stepped once per iteration via a real
             # LambdaLR scheduler, instead of the previous dead
             # `lr_ = base_lr` (which never actually decayed).
-            scheduler.step()
+            if optimizer_stepped:
+                scheduler.step()
             lr_ = optimizer.param_groups[0]['lr']
 
             iter_num += 1
