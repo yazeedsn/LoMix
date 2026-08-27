@@ -578,7 +578,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             logging.info(
                 'iteration %d, epoch %d : loss : %f, deep_supervision_loss : %f, mutation_loss : %f, lr: %f' % (
                     iter_num, epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
-            print('[TRAIN] epoch %d done -> loss: %.4f, deep_supervision_loss: %.4f, mutation_loss: %.4f, lr: %.2e' % (
+            print('\n[TRAIN] epoch %d done -> loss: %.4f, deep_supervision_loss: %.4f, mutation_loss: %.4f, lr: %.2e' % (
                 epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
 
             raw.loss_module.print_weights()
