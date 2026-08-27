@@ -6,6 +6,7 @@ import sys
 import time
 import numpy as np
 from itertools import combinations
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -137,14 +138,6 @@ class CombinatorialMutationsLossModule(nn.Module):
             synthesized combo, in the SAME order as before (grouped by op,
             then by combo index within that op) so downstream weight
             bookkeeping still lines up 1:1 by position.
-
-        Previously each combo was produced by its own small Python-level
-        sequence of ops (and, for 'concat'/'weighted_fusion', its own full
-        module forward call) inside a doubly-nested Python loop — ~44 combos
-        each dispatching several tiny CUDA kernels. Here, combos are grouped
-        by (op, combo-size k) and processed as a SINGLE batched tensor
-        operation per group, cutting the kernel-launch count from ~150+ down
-        to roughly one per (op, k) group (a handful of groups total).
         """
         device = maps.device
         M, B, C, H, W = maps.shape
@@ -156,19 +149,16 @@ class CombinatorialMutationsLossModule(nn.Module):
             if not combos:
                 continue
 
-            # group this op's combos by their size k, since gather/grouped-conv
-            # shapes must be uniform within a batched call
             by_k = {}
             for local_idx, comb in enumerate(combos):
                 by_k.setdefault(len(comb), []).append((local_idx, comb))
 
-            # collect (local_idx -> tensor) so we can re-assemble in original order
             produced = {}
 
             if op in elementwise_ops:
                 for k, items in by_k.items():
-                    idx_tensor = torch.tensor([comb for _, comb in items], device=device, dtype=torch.long)  # [Ck, k]
-                    gathered = maps[idx_tensor]  # [Ck, k, B, C, H, W]
+                    idx_tensor = torch.tensor([comb for _, comb in items], device=device, dtype=torch.long)
+                    gathered = maps[idx_tensor]
                     if op == 'add':
                         combined = gathered.sum(dim=1)
                     elif op == 'avg':
@@ -183,56 +173,43 @@ class CombinatorialMutationsLossModule(nn.Module):
                         produced[local_idx] = combined[j]
 
             elif op == 'concat':
-                # Each combo has its OWN learned 1x1 conv (different weights),
-                # so a plain shared conv can't be used. Instead we run every
-                # same-size combo's conv as one GROUPED convolution: weights
-                # and inputs from all combos in the group are concatenated
-                # along the channel axis, and F.conv2d(..., groups=num_combos)
-                # applies each combo's distinct weight to its own channel
-                # slice in a single kernel call.
                 for k, items in by_k.items():
                     cat_inputs, weights, biases = [], [], []
                     for local_idx, comb in items:
-                        cat_inputs.append(torch.cat([maps[c] for c in comb], dim=1))  # [B, k*C, H, W]
+                        cat_inputs.append(torch.cat([maps[c] for c in comb], dim=1))
                         conv = self.concat_convs[str(local_idx)]
-                        weights.append(conv.weight)  # [C, k*C, 1, 1]
+                        weights.append(conv.weight)
                         if conv.bias is not None:
                             biases.append(conv.bias)
                         else:
                             biases.append(torch.zeros(self.num_classes, device=device))
-                    grouped_input = torch.cat(cat_inputs, dim=1)      # [B, Ck*k*C, H, W]
-                    grouped_weight = torch.cat(weights, dim=0)        # [Ck*C, k*C, 1, 1]
-                    grouped_bias = torch.cat(biases, dim=0)           # [Ck*C]
+                    grouped_input = torch.cat(cat_inputs, dim=1)
+                    grouped_weight = torch.cat(weights, dim=0)
+                    grouped_bias = torch.cat(biases, dim=0)
                     grouped_out = F.conv2d(grouped_input, grouped_weight, grouped_bias, groups=len(items))
                     outs = grouped_out.split(self.num_classes, dim=1)
                     for (local_idx, _), out in zip(items, outs):
                         produced[local_idx] = out
 
             elif op in ('weighted_fusion', 'wf'):
-                # weight_convs[i] is SHARED across every same-size combo
-                # already (one WeightedFusion module per k), so instead of
-                # running the whole submodule once per combo, batch all
-                # same-size combos into the conv's input batch dimension and
-                # run each stage's conv exactly once.
                 for k, items in by_k.items():
                     mod = self.weighted_fusion_modules[str(k)]
-                    idx_tensor = torch.tensor([comb for _, comb in items], device=device, dtype=torch.long)  # [Ck, k]
-                    gathered = maps[idx_tensor]  # [Ck, k, B, C, H, W]
+                    idx_tensor = torch.tensor([comb for _, comb in items], device=device, dtype=torch.long)
+                    gathered = maps[idx_tensor]
                     Ck = gathered.shape[0]
                     weight_maps = []
                     for i in range(k):
                         stage_input = gathered[:, i].reshape(Ck * B, C, H, W)
-                        wmap = mod.weight_convs[i](stage_input)          # [Ck*B, 1, H, W]
+                        wmap = mod.weight_convs[i](stage_input)
                         weight_maps.append(wmap.reshape(Ck, B, 1, H, W))
-                    weights_stack = torch.stack(weight_maps, dim=1)      # [Ck, k, B, 1, H, W]
+                    weights_stack = torch.stack(weight_maps, dim=1)
                     weights_stack = F.softmax(weights_stack, dim=1)
-                    fused = (weights_stack * gathered).sum(dim=1)        # [Ck, B, C, H, W]
+                    fused = (weights_stack * gathered).sum(dim=1)
                     for j, (local_idx, _) in enumerate(items):
                         produced[local_idx] = fused[j]
             else:
                 raise ValueError(f"Unsupported op: {op}")
 
-            # re-assemble in original combo order for this op
             for local_idx in range(len(combos)):
                 fused_logits.append(produced[local_idx])
 
@@ -242,17 +219,14 @@ class CombinatorialMutationsLossModule(nn.Module):
         device = output_maps[0].device
         compute_loss = label_batch is not None and ce_loss is not None and dice_loss is not None
 
-        maps = torch.stack(output_maps, dim=0)  # [M, B, C, H, W]
+        maps = torch.stack(output_maps, dim=0)
         M = maps.shape[0]
 
         fused_logits = self._generate_mutations(maps)
 
         if not compute_loss:
-            # Preserve the original return contract: only the synthesized
-            # combo maps (not the originals), as a plain python list.
             return fused_logits
 
-        # Build the weight vector aligned 1:1 with [originals..., combos...]
         if self.use_learnable_weights:
             orig_vals, synth_vals = self._compute_all_weights()
             weight_list = list(orig_vals)
@@ -263,18 +237,10 @@ class CombinatorialMutationsLossModule(nn.Module):
             n_total = M + len(fused_logits)
             weight_list = [torch.ones(1, device=device) for _ in range(n_total)]
 
-        weights_tensor = torch.cat(weight_list)  # [N]
+        weights_tensor = torch.cat(weight_list)
 
-        all_logits = torch.stack(list(maps.unbind(0)) + fused_logits, dim=0)  # [N, B, C, H, W]
+        all_logits = torch.stack(list(maps.unbind(0)) + fused_logits, dim=0)
 
-        # VECTORIZED loss aggregation: instead of calling ce_loss/dice_loss in
-        # a Python loop once per map (N ~= 48 sequential small calls), use
-        # torch.func.vmap to evaluate both loss functions across all N maps
-        # as a single batched call. vmap works generically even though
-        # dice_loss's internal reduction may be non-linear (it re-executes
-        # the function's tensor ops with an added batch dimension, rather
-        # than relying on any mathematical decomposability), so results are
-        # numerically identical to calling each loss N separate times.
         def per_map_losses(logits, label):
             ce = ce_loss(logits, label.long())
             dc = dice_loss(logits, label, softmax=True)
@@ -284,10 +250,6 @@ class CombinatorialMutationsLossModule(nn.Module):
             from torch.func import vmap
             ces, dices = vmap(per_map_losses, in_dims=(0, None))(all_logits, label_batch)
         except Exception:
-            # Fallback for older torch versions or loss modules that use
-            # ops incompatible with vmap's batching transform (e.g. Python
-            # control flow that branches on tensor values). Still correct,
-            # just not kernel-batched.
             ces_list, dices_list = [], []
             for i in range(all_logits.shape[0]):
                 ce, dc = per_map_losses(all_logits[i], label_batch)
@@ -296,8 +258,8 @@ class CombinatorialMutationsLossModule(nn.Module):
             ces = torch.stack(ces_list)
             dices = torch.stack(dices_list)
 
-        combined_per_map = self.lc1 * ces + self.lc2 * dices  # [N]
-        weighted_per_map = combined_per_map * weights_tensor  # [N]
+        combined_per_map = self.lc1 * ces + self.lc2 * dices
+        weighted_per_map = combined_per_map * weights_tensor
 
         deep_supervision_loss = weighted_per_map[:M].sum()
         mutation_loss = weighted_per_map[M:].sum()
@@ -348,13 +310,7 @@ class CombinatorialMutationsLossModule(nn.Module):
 class ModelWithLoss(nn.Module):
     """
     Wraps the segmentation model and the loss module together so that a
-    SINGLE DistributedDataParallel wrapper covers both sets of parameters
-    (including the loss module's learnable combination weights and its
-    concat_convs). DDP needs every parameter that receives gradients to be
-    inside the wrapped module so it can register its gradient-sync hooks;
-    keeping model and loss_module as two separately-optimized objects (as
-    the DataParallel version did) would otherwise require two DDP wrappers
-    or manual gradient handling.
+    SINGLE DistributedDataParallel wrapper covers both sets of parameters.
     """
     def __init__(self, model, loss_module, supervision, lc1=0.3, lc2=0.7):
         super().__init__()
@@ -384,11 +340,7 @@ class ModelWithLoss(nn.Module):
 def setup_distributed():
     """
     Reads the env vars torchrun sets (RANK, LOCAL_RANK, WORLD_SIZE) and
-    initializes the NCCL process group. Returns (rank, local_rank, world_size,
-    is_distributed). Falls back to a single-process/single-GPU run if the
-    script wasn't launched with torchrun (no distributed env vars present),
-    so this file still works with `python train_synapse_lomix.py ...` on one
-    GPU without any special casing elsewhere.
+    initializes the NCCL process group.
     """
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
@@ -407,24 +359,13 @@ def is_main_process(rank):
 
 @torch.no_grad()
 def inference(args, model, best_performance, db_test, testloader, device, rank):
-    """
-    FIX: db_test / testloader are now built ONCE outside the epoch loop and
-    passed in, instead of being rebuilt (and re-preloaded from disk into RAM)
-    on every single call.
-
-    DDP note: run only on rank 0. Each validation "batch" is one full 3D
-    volume (batch_size=1) processed slice-by-slice inside val_single_volume,
-    so splitting it across ranks would need extra gather/reduce logic for
-    little benefit relative to training-time cost. Other ranks just wait at
-    the barrier in trainer_synapse() while rank 0 evaluates.
-    """
     if not is_main_process(rank):
         return best_performance
 
     logging.info("{} test iterations per epoch".format(len(testloader)))
     model.eval()
     metric_list = 0.0
-    for i_batch, sampled_batch in enumerate(testloader):
+    for i_batch, sampled_batch in enumerate(tqdm(testloader, desc='validation', leave=False)):
         h, w = sampled_batch["image"].size()[2:]
         image, label = sampled_batch["image"], sampled_batch["label"]
         case_name = sampled_batch['case_name'][0]
@@ -435,6 +376,7 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
     metric_list = metric_list / len(db_test)
     performance = np.mean(metric_list, axis=0)
     logging.info('Testing performance in val model: mean_dice : %f, best_dice : %f' % (performance, best_performance))
+    print('[VAL] mean_dice: %.4f (best so far: %.4f)' % (performance, best_performance))
     model.train()
     return performance
 
@@ -451,14 +393,10 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         logging.info(str(args))
         logging.info(f"Distributed: {is_distributed}, world_size: {world_size}")
     else:
-        logging.basicConfig(level=logging.CRITICAL)  # silence non-main ranks
+        logging.basicConfig(level=logging.CRITICAL)
 
     base_lr = args.base_lr
     num_classes = args.num_classes
-    # FIX: with DDP, args.batch_size is the PER-GPU batch size (each process
-    # handles its own batch independently), unlike DataParallel where the
-    # supplied batch was split across GPUs internally. So no more "* args.n_gpu"
-    # here — the effective global batch size is batch_size * world_size.
     batch_size = args.batch_size
 
     db_train = Synapse_preloaded_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train",
@@ -471,9 +409,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id + rank * 1000)
 
-    # FIX: DistributedSampler replaces shuffle=True — each rank sees a
-    # disjoint shard of the dataset per epoch. sampler.set_epoch(...) below
-    # is required so the shuffling differs across epochs.
     if is_distributed:
         train_sampler = DistributedSampler(db_train, num_replicas=world_size, rank=rank, shuffle=True,
                                             seed=args.seed)
@@ -486,9 +421,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                               num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn,
                               persistent_workers=True, prefetch_factor=4, drop_last=is_distributed)
 
-    # Validation set / loader: only rank 0 actually needs it (see inference()),
-    # but build it on all ranks cheaply guarded by rank to avoid every process
-    # preloading the volumes into RAM redundantly.
     if is_main_process(rank):
         db_test = Synapse_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir,
                                              nclass=args.num_classes)
@@ -507,15 +439,9 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     combined = ModelWithLoss(model, loss_module, supervision, lc1=lc1, lc2=lc2).to(device)
 
     if is_distributed:
-        # FIX: DistributedDataParallel instead of DataParallel. Each GPU runs
-        # its own process (no shared-GIL orchestration bottleneck), gradients
-        # are synced via an efficient NCCL all-reduce that overlaps with
-        # backward(), and the model isn't re-replicated to every GPU on every
-        # forward pass the way DataParallel does it. This is the main fix for
-        # the near-0% GPU utilization observed with DataParallel.
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
                         find_unused_parameters=False)
-        raw = combined.module  # unwrapped access for checkpointing / eval
+        raw = combined.module
     else:
         raw = combined
 
@@ -532,15 +458,16 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     if is_main_process(rank):
         logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
-    iterator = range(max_epoch)
+    iterator = tqdm(range(max_epoch), ncols=70) if is_main_process(rank) else range(max_epoch)
 
     for epoch_num in iterator:
         if is_distributed:
             train_sampler.set_epoch(epoch_num)
 
+        epoch_bar = tqdm(trainloader, desc=f'Epoch {epoch_num}', leave=False, ncols=100, mininterval=1.0) \
+            if is_main_process(rank) else trainloader
 
-
-        for i_batch, sampled_batch in enumerate(trainloader):
+        for i_batch, sampled_batch in enumerate(epoch_bar):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch = image_batch.to(device, non_blocking=True)
             label_batch = label_batch.squeeze(1).to(device, non_blocking=True)
@@ -561,6 +488,12 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             iter_num += 1
 
             if is_main_process(rank):
+                epoch_bar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'ds': f"{deep_supervision_loss.item():.4f}",
+                    'mut': f"{mutation_loss.item():.4f}",
+                    'lr': f"{lr_:.2e}",
+                }, refresh=False)
                 writer.add_scalar('info/lr', lr_, iter_num)
                 writer.add_scalar('info/total_loss', loss, iter_num)
                 writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
@@ -576,18 +509,14 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             logging.info(
                 'iteration %d, epoch %d : loss : %f, deep_supervision_loss : %f, mutation_loss : %f, lr: %f' % (
                     iter_num, epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
+            print('[TRAIN] epoch %d done -> loss: %.4f, deep_supervision_loss: %.4f, mutation_loss: %.4f, lr: %.2e' % (
+                epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
 
             raw.loss_module.print_weights()
 
             save_mode_path = os.path.join(snapshot_path, 'last.pth')
             torch.save(raw.model.state_dict(), save_mode_path)
 
-        # FIX: all ranks must reach this barrier together. Rank 0 runs
-        # inference (see is_main_process check inside inference()); other
-        # ranks would otherwise race ahead into the next epoch's forward
-        # pass while rank 0 is still validating, which can desync NCCL
-        # collectives if a later all-reduce assumes every rank is at the
-        # same step.
         if is_distributed:
             dist.barrier()
 
