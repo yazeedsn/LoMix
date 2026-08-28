@@ -504,7 +504,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                 p.register_hook(_force_canonical_grad_strides)
 
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=False)
+                        find_unused_parameters=True)
         raw = combined.module
     else:
         raw = combined
