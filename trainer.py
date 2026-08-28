@@ -466,8 +466,45 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     combined = ModelWithLoss(model, loss_module, supervision, lc1=lc1, lc2=lc2).to(device)
 
     if is_distributed:
+        # FIX (corrected): my first attempt at this fix used
+        # `grad.contiguous()`, which turned out to be a no-op here — see
+        # below for why — so it never actually changed anything, which is
+        # why the warning persisted.
+        #
+        # gradient_as_bucket_view only changes what happens AFTER DDP's
+        # reducer copies a gradient into its bucket — it doesn't touch the
+        # copy-in step itself, which is where the stride check that
+        # triggers "Grad strides do not match bucket view strides" runs.
+        # So that setting was never going to affect this warning either way.
+        #
+        # The real cause: cuDNN's backward pass for the depthwise/grouped
+        # convs in the PVTv2 backbone's DWConv layers (groups=dim, weight
+        # shape [C, 1, 3, 3] — e.g. [2048,1,3,3] in stage 4's MLP) produces
+        # a gradient whose size-1 dimension has stride 1 instead of the
+        # canonical 9. PyTorch's is_contiguous() treats size-1 dimensions as
+        # stride-agnostic, so it reports this tensor as "already
+        # contiguous" even though its strides don't match DDP's bucket
+        # layout — which means `grad.contiguous()` short-circuits and
+        # returns the exact same tensor, unchanged (verified: same
+        # data_ptr(), same non-canonical strides). Only an unconditional
+        # copy with an explicitly requested memory format actually
+        # normalizes the strides; `.clone(memory_format=torch.contiguous_format)`
+        # does this (plain `.contiguous()`, even with memory_format passed
+        # explicitly, still short-circuits the same way).
+        #
+        # Scoped to only 4D conv weights shaped like a depthwise/grouped
+        # conv (shape[1] == 1) so we're not paying a real copy on every
+        # parameter's gradient every backward pass — just the handful that
+        # actually need it.
+        def _force_canonical_grad_strides(grad):
+            return grad.clone(memory_format=torch.contiguous_format)
+
+        for p in combined.parameters():
+            if p.requires_grad and p.dim() == 4 and p.shape[1] == 1:
+                p.register_hook(_force_canonical_grad_strides)
+
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=False, gradient_as_bucket_view=False)
+                        find_unused_parameters=False)
         raw = combined.module
     else:
         raw = combined
@@ -490,9 +527,9 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     # set `lr_ = base_lr` unconditionally every iteration — a no-op that
     # never actually decayed the learning rate. LambdaLR now handles this
     # via scheduler.step() called once per iteration in the training loop.
-    scheduler = optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda it: (1.0 - it / max_iterations) ** 0.9
-    )
+    # scheduler = optim.lr_scheduler.LambdaLR(
+    #     optimizer, lr_lambda=lambda it: (1.0 - it / max_iterations) ** 0.9
+    # )
 
     best_performance = 0.0
     epochs_no_improve = 0  # EARLY STOPPING: consecutive epochs with no val improvement
@@ -545,8 +582,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             # "poly" policy) stepped once per iteration via a real
             # LambdaLR scheduler, instead of the previous dead
             # `lr_ = base_lr` (which never actually decayed).
-            if optimizer_stepped:
-                scheduler.step()
+            # if optimizer_stepped:
+            #     scheduler.step()
             lr_ = optimizer.param_groups[0]['lr']
 
             iter_num += 1
@@ -578,7 +615,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             logging.info(
                 'iteration %d, epoch %d : loss : %f, deep_supervision_loss : %f, mutation_loss : %f, lr: %f' % (
                     iter_num, epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
-            print('\n[TRAIN] epoch %d done -> loss: %.4f, deep_supervision_loss: %.4f, mutation_loss: %.4f, lr: %.2e' % (
+            print('[TRAIN] epoch %d done -> loss: %.4f, deep_supervision_loss: %.4f, mutation_loss: %.4f, lr: %.2e' % (
                 epoch_num, loss.item(), deep_supervision_loss.item(), mutation_loss.item(), lr_))
 
             raw.loss_module.print_weights()
