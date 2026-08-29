@@ -13,15 +13,25 @@ from trainer import trainer_synapse
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--root_path', type=str,
-                    default='./data/synapse/train_npz_new', help='root dir for data')
+                    default='./data/synapse/train_npz_new',
+                    help='root dir for data. For ACDC, point this at the ACDC training slices dir '
+                         '(e.g. ./data/acdc/train_npz), preprocessed into the same .npz format '
+                         '(keys "image"/"label") as Synapse.')
 parser.add_argument('--volume_path', type=str,
-                    default='./data/synapse/test_vol_h5_new', help='root dir for validation volume data')
+                    default='./data/synapse/test_vol_h5_new',
+                    help='root dir for validation volume data. For ACDC, point this at the ACDC '
+                         'validation volumes dir, preprocessed into the same .npy.h5 format as Synapse.')
 parser.add_argument('--dataset', type=str,
-                    default='Synapse', help='experiment_name')
+                    default='Synapse', choices=['Synapse', 'ACDC'],
+                    help='experiment_name / which dataset config to use')
 parser.add_argument('--list_dir', type=str,
-                    default='./lists/lists_Synapse', help='list dir')
+                    default='./lists/lists_Synapse',
+                    help='list dir. For ACDC, pass --list_dir ./lists/lists_ACDC (or wherever your '
+                         'ACDC train/test_vol .txt split files live) — this default only applies to Synapse.')
 parser.add_argument('--num_classes', type=int,
-                    default=9, help='output channel of network')
+                    default=9,
+                    help='output channel of network. NOTE: this is overridden below based on --dataset '
+                         '(9 for Synapse, 4 for ACDC) to match each dataset\'s fixed label set.')
 # network related parameters
 parser.add_argument('--encoder', type=str,
                     default='pvt_v2_b2', help='Name of encoder: pvt_v2_b2, pvt_v2_b0, resnet18, resnet34 ...')
@@ -52,6 +62,10 @@ parser.add_argument('--base_lr', type=float,  default=0.0001,
                     help='segmentation network learning rate')
 parser.add_argument('--img_size', type=int,
                     default=224, help='input patch size of network input')
+parser.add_argument('--z_spacing', type=int, default=1,
+                    help='slice spacing used when reconstructing volumes for validation metrics. '
+                         'Defaults to 1 for both Synapse and ACDC; override if your preprocessing '
+                         'pipeline uses a different physical slice spacing.')
 parser.add_argument('--n_gpu', type=int, default=1, help='total gpu (kept for snapshot-path naming; actual '
                     'world size for DDP comes from torchrun, not this flag)')
 parser.add_argument('--deterministic', type=int,  default=1,
@@ -75,15 +89,40 @@ if __name__ == "__main__":
     torch.cuda.manual_seed(args.seed)
     
     dataset_name = args.dataset
+    # ACDC ADDED: dataset_config now covers both Synapse and ACDC. root_path,
+    # volume_path, and list_dir all continue to come straight from the CLI
+    # args (--root_path/--volume_path/--list_dir) exactly as before — nothing
+    # here hardcodes dataset-specific paths, so running with --dataset ACDC
+    # just requires also passing --list_dir (and --root_path/--volume_path if
+    # your ACDC data lives somewhere other than the Synapse defaults above).
+    # num_classes and z_spacing are the only genuinely dataset-specific
+    # values: ACDC's standard label set is background + RV + myocardium + LV
+    # = 4 classes (vs. Synapse's 9). z_spacing defaults to 1 for both here;
+    # override via --z_spacing if your ACDC volumes were preprocessed with a
+    # different physical slice spacing baked into the validation/metric code.
     dataset_config = {
         'Synapse': {
             'root_path': args.root_path,
             'volume_path': args.volume_path,
             'list_dir': args.list_dir,
-            'num_classes': args.num_classes,
-            'z_spacing': 1,
+            'num_classes': 9,
+            'z_spacing': args.z_spacing,
+        },
+        'ACDC': {
+            'root_path': args.root_path,
+            'volume_path': args.volume_path,
+            'list_dir': args.list_dir,
+            'num_classes': 4,
+            'z_spacing': args.z_spacing,
         },
     }
+    if dataset_name not in dataset_config:
+        raise ValueError(
+            f"Unsupported --dataset '{dataset_name}'. Supported datasets: {list(dataset_config.keys())}. "
+            f"To add another dataset, add an entry to dataset_config with the correct num_classes, and "
+            f"make sure its data is preprocessed into the same .npz (train slices) / .npy.h5 (test "
+            f"volumes) format the Synapse_preloaded_dataset/Synapse_dataset classes expect."
+        )
     args.num_classes = dataset_config[dataset_name]['num_classes']
     args.root_path = dataset_config[dataset_name]['root_path']
     args.volume_path = dataset_config[dataset_name]['volume_path']
@@ -150,5 +189,11 @@ if __name__ == "__main__":
     if local_rank == 0:
         print('Model successfully created.')
     
-    trainer = {'Synapse': trainer_synapse,}
+    # ACDC ADDED: both datasets route through the same trainer_synapse
+    # function. Nothing in trainer_synapse.py or the Synapse_preloaded_dataset
+    # / Synapse_dataset classes is Synapse-specific beyond variable naming —
+    # they're driven entirely by the root_path/volume_path/list_dir/num_classes
+    # already resolved above, so ACDC works through the identical training
+    # loop, DDP setup, AMP, LR scheduler, and early-stopping logic.
+    trainer = {'Synapse': trainer_synapse, 'ACDC': trainer_synapse}
     trainer[dataset_name](args, model, snapshot_path, supervision=args.supervision, operations=operations, use_learnable_weights=use_learnable_weights)
