@@ -21,7 +21,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torch.amp import GradScaler, autocast
 
-from utils.dataset_synapse import Synapse_preloaded_dataset, Synapse_dataset, RandomGenerator
+from utils.dataset_synapse import (Synapse_preloaded_dataset, Synapse_dataset,
+                                    ACDC_preloaded_dataset, ACDCdataset, RandomGenerator)
 from utils.utils import powerset  # , cal_params_flops
 from utils.utils import one_hot_encoder
 from utils.utils import DiceLoss
@@ -426,10 +427,29 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     num_classes = args.num_classes
     batch_size = args.batch_size
 
-    db_train = Synapse_preloaded_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train",
-                                          nclass=args.num_classes,
-                                          transform=transforms.Compose(
-                                              [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+    # Dispatch to the right dataset classes/kwargs based on args.dataset.
+    # ACDC's classes take no nclass kwarg (unlike Synapse's 13->9 class
+    # remap) and its full-volume validation split is conventionally named
+    # "test" rather than Synapse's "test_vol" — adjust test_split_name here
+    # if your ACDC list files use a different name.
+    dataset_name = getattr(args, 'dataset', 'Synapse')
+    if dataset_name == 'ACDC':
+        train_dataset_cls = ACDC_preloaded_dataset
+        test_dataset_cls = ACDCdataset
+        test_split_name = 'test'
+        train_kwargs = {}
+        test_kwargs = {}
+    else:
+        train_dataset_cls = Synapse_preloaded_dataset
+        test_dataset_cls = Synapse_dataset
+        test_split_name = 'test_vol'
+        train_kwargs = {'nclass': args.num_classes}
+        test_kwargs = {'nclass': args.num_classes}
+
+    db_train = train_dataset_cls(base_dir=args.root_path, list_dir=args.list_dir, split="train",
+                                  transform=transforms.Compose(
+                                      [RandomGenerator(output_size=[args.img_size, args.img_size])]),
+                                  **train_kwargs)
     if is_main_process(rank):
         print("The length of train set is: {}".format(len(db_train)))
 
@@ -449,8 +469,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                               persistent_workers=True, prefetch_factor=4, drop_last=is_distributed)
 
     if is_main_process(rank):
-        db_test = Synapse_dataset(base_dir=args.volume_path, split="test_vol", list_dir=args.list_dir,
-                                             nclass=args.num_classes)
+        db_test = test_dataset_cls(base_dir=args.volume_path, split=test_split_name, list_dir=args.list_dir,
+                                    **test_kwargs)
         testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     else:
         db_test, testloader = None, None
@@ -504,7 +524,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                 p.register_hook(_force_canonical_grad_strides)
 
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=True)
+                        find_unused_parameters=False)
         raw = combined.module
     else:
         raw = combined
@@ -527,9 +547,9 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     # set `lr_ = base_lr` unconditionally every iteration — a no-op that
     # never actually decayed the learning rate. LambdaLR now handles this
     # via scheduler.step() called once per iteration in the training loop.
-    # scheduler = optim.lr_scheduler.LambdaLR(
-    #     optimizer, lr_lambda=lambda it: (1.0 - it / max_iterations) ** 0.9
-    # )
+    scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda it: (1.0 - it / max_iterations) ** 0.9
+    )
 
     best_performance = 0.0
     epochs_no_improve = 0  # EARLY STOPPING: consecutive epochs with no val improvement
@@ -582,8 +602,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             # "poly" policy) stepped once per iteration via a real
             # LambdaLR scheduler, instead of the previous dead
             # `lr_ = base_lr` (which never actually decayed).
-            # if optimizer_stepped:
-            #     scheduler.step()
+            if optimizer_stepped:
+                scheduler.step()
             lr_ = optimizer.param_groups[0]['lr']
 
             iter_num += 1
