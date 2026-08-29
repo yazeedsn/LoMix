@@ -609,6 +609,10 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             iter_num += 1
 
             if is_main_process(rank):
+                if loss_module.use_learnable_weights:
+                    with torch.no_grad():
+                        for i, weight in enumerate(loss_module.original_weights):
+                            writer.add_scalar(f"weights/original_weight_{i}", weight.item(), iter_num)
                 writer.add_scalar('info/lr', lr_, iter_num)
                 writer.add_scalar('info/total_loss', loss, iter_num)
                 writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
