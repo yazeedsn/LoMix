@@ -147,7 +147,7 @@ class Synapse_preloaded_dataset(Dataset):
         cached = self.data_cache[idx]
         sample = {'image': cached['image'], 'label': cached['label']}
 
-        if self.transform:
+        if self.transform and self.split == "train":
             sample = self.transform(sample)
 
         sample['case_name'] = cached['case_name']
