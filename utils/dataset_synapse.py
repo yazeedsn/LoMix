@@ -103,7 +103,7 @@ class Synapse_preloaded_dataset(Dataset):
         # variable instead of `self.split`, so __getitem__'s
         # `self.split == "train"` check below would raise AttributeError the
         # moment a transform was supplied (i.e. on every training batch).
-        sample_list = open(os.path.join(list_dir,  + '.txt')).readlines()
+        sample_list = open(os.path.join(list_dir, split + '.txt')).readlines()
         data_dir = base_dir
         self.nclass = nclass
 
@@ -212,7 +212,7 @@ class ACDC_preloaded_dataset(Dataset):
         for line in tqdm(sample_list, desc=f'Preloading ACDC {split} data', unit='sample'):
             case_name = line.strip('\n')
             if split == "train" or split == "valid":
-                data_path = os.path.join(data_dir, case_name)
+                data_path = os.path.join(data_dir, split, case_name)
             else:
                 data_path = os.path.join(data_dir, case_name)
 
