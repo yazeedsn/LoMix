@@ -14,20 +14,22 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--root_path', type=str,
                     default='./data/synapse/train_npz_new',
-                    help='root dir for data. For ACDC, point this at the ACDC training slices dir '
-                         '(e.g. ./data/acdc/train_npz), preprocessed into the same .npz format '
-                         '(keys "image"/"label") as Synapse.')
+                    help='root dir for data. For Synapse: the training slices dir. For ACDC: the SINGLE '
+                         'shared parent dir containing train/valid/test subfolders (e.g. ./data/ACDC) — '
+                         'trainer_synapse.py uses this same path for all three ACDC splits, so '
+                         '--volume_path is not needed for ACDC.')
 parser.add_argument('--volume_path', type=str,
                     default='./data/synapse/test_vol_h5_new',
-                    help='root dir for validation volume data. For ACDC, point this at the ACDC '
-                         'validation volumes dir, preprocessed into the same .npy.h5 format as Synapse.')
+                    help='root dir for validation volume data. Only used for Synapse (its train and '
+                         'validation data live in separate directories). Ignored when --dataset ACDC, '
+                         'since ACDC\'s train/valid/test all live under the single --root_path dir.')
 parser.add_argument('--dataset', type=str,
                     default='Synapse', choices=['Synapse', 'ACDC'],
                     help='experiment_name / which dataset config to use')
 parser.add_argument('--list_dir', type=str,
                     default='./lists/lists_Synapse',
-                    help='list dir. For ACDC, pass --list_dir ./lists/lists_ACDC (or wherever your '
-                         'ACDC train/test_vol .txt split files live) — this default only applies to Synapse.')
+                    help='list dir. For ACDC, pass --list_dir data/ACDC/lists_ACDC (containing '
+                         'train.txt/valid.txt/test.txt) — this default only applies to Synapse.')
 parser.add_argument('--num_classes', type=int,
                     default=9,
                     help='output channel of network. NOTE: this is overridden below based on --dataset '
