@@ -401,13 +401,18 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
 
 @torch.no_grad()
 def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
-                    final_test_split_name, writer, iter_num):
+                    final_test_split_name, base_dir, writer, iter_num):
     """
     One-time evaluation on a genuinely held-out test split, run once after
     training finishes (not every epoch, unlike inference() above). Only
     called when final_test_split_name is not None — i.e. when the dataset
     actually has a test split distinct from whatever was used for per-epoch
     validation (Synapse doesn't; ACDC does).
+
+    base_dir is passed in explicitly (rather than hardcoding args.volume_path)
+    since ACDC's train/valid/test splits all live under ONE shared parent
+    directory (base_dir/{train,valid,test}/...), unlike Synapse's convention
+    of separate root_path (train) / volume_path (validation) directories.
 
     Loads the BEST checkpoint (best.pth) before evaluating, since the model
     left in memory at the end of training holds the LAST epoch's weights,
@@ -431,7 +436,7 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
     raw.model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     logging.info(f"[TEST] Loaded checkpoint for final test evaluation: {ckpt_path}")
 
-    db_final_test = test_dataset_cls(base_dir=args.volume_path, split=final_test_split_name,
+    db_final_test = test_dataset_cls(base_dir=base_dir, split=final_test_split_name,
                                       list_dir=args.list_dir, **test_kwargs)
     final_testloader = DataLoader(db_final_test, batch_size=1, shuffle=False, num_workers=1)
 
@@ -537,6 +542,14 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         final_test_split_name = 'test'
         train_kwargs = {}
         test_kwargs = {}
+        # FIX: ACDC's train/valid/test all live under ONE shared parent dir
+        # (e.g. data/ACDC/{train,valid,test}), unlike Synapse's convention of
+        # a separate root_path (train) and volume_path (validation)
+        # directory. Using args.root_path for every ACDC split means you
+        # only need to pass --root_path data/ACDC — --volume_path is simply
+        # unused for ACDC, instead of having to redundantly pass the same
+        # path to both flags.
+        eval_base_dir = args.root_path
     else:
         train_dataset_cls = Synapse_preloaded_dataset
         test_dataset_cls = Synapse_dataset
@@ -544,6 +557,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         final_test_split_name = None
         train_kwargs = {'nclass': args.num_classes}
         test_kwargs = {'nclass': args.num_classes}
+        eval_base_dir = args.volume_path
 
     db_train = train_dataset_cls(base_dir=args.root_path, list_dir=args.list_dir, split="train",
                                   transform=transforms.Compose(
@@ -568,7 +582,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                               persistent_workers=True, prefetch_factor=4, drop_last=is_distributed)
 
     if is_main_process(rank):
-        db_test = test_dataset_cls(base_dir=args.volume_path, split=val_split_name, list_dir=args.list_dir,
+        db_test = test_dataset_cls(base_dir=eval_base_dir, split=val_split_name, list_dir=args.list_dir,
                                     **test_kwargs)
         testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     else:
@@ -833,7 +847,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     if final_test_split_name is not None:
         if is_main_process(rank):
             run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
-                            final_test_split_name, writer, iter_num)
+                            final_test_split_name, eval_base_dir, writer, iter_num)
         if is_distributed:
             dist.barrier()
     else:
