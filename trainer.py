@@ -399,6 +399,91 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
     return performance
 
 
+@torch.no_grad()
+def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
+                    final_test_split_name, writer, iter_num):
+    """
+    One-time evaluation on a genuinely held-out test split, run once after
+    training finishes (not every epoch, unlike inference() above). Only
+    called when final_test_split_name is not None — i.e. when the dataset
+    actually has a test split distinct from whatever was used for per-epoch
+    validation (Synapse doesn't; ACDC does).
+
+    Loads the BEST checkpoint (best.pth) before evaluating, since the model
+    left in memory at the end of training holds the LAST epoch's weights,
+    not necessarily the best-performing ones. Falls back to last.pth with a
+    warning if best.pth is missing for some reason.
+    """
+    if not is_main_process(rank):
+        return None
+
+    best_ckpt_path = os.path.join(snapshot_path, 'best.pth')
+    last_ckpt_path = os.path.join(snapshot_path, 'last.pth')
+    if os.path.exists(best_ckpt_path):
+        ckpt_path = best_ckpt_path
+    elif os.path.exists(last_ckpt_path):
+        logging.info(f"[TEST] best.pth not found at {best_ckpt_path}; falling back to last.pth for final test.")
+        ckpt_path = last_ckpt_path
+    else:
+        logging.info("[TEST] No checkpoint found (neither best.pth nor last.pth); skipping final test evaluation.")
+        return None
+
+    raw.model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    logging.info(f"[TEST] Loaded checkpoint for final test evaluation: {ckpt_path}")
+
+    db_final_test = test_dataset_cls(base_dir=args.volume_path, split=final_test_split_name,
+                                      list_dir=args.list_dir, **test_kwargs)
+    final_testloader = DataLoader(db_final_test, batch_size=1, shuffle=False, num_workers=1)
+
+    logging.info(f"[TEST] {len(final_testloader)} final test iterations.")
+    raw.model.eval()
+    metric_list = 0.0
+    for i_batch, sampled_batch in enumerate(final_testloader):
+        image, label = sampled_batch["image"], sampled_batch["label"]
+        case_name = sampled_batch['case_name'][0]
+        metric_i = val_single_volume(image, label, raw.model, classes=args.num_classes,
+                                      patch_size=[args.img_size, args.img_size],
+                                      case=case_name, z_spacing=args.z_spacing)
+        metric_list += np.array(metric_i)
+    metric_list = metric_list / len(db_final_test)
+    performance = np.mean(metric_list, axis=0)
+
+    logging.info('[TEST] Final test performance: mean_dice : %f (checkpoint: %s)' % (performance, ckpt_path))
+    print('[TEST] Final test mean_dice: %.4f (checkpoint: %s)' % (performance, ckpt_path))
+
+    # Per-class breakdown: metric_list (before the np.mean(axis=0) collapse
+    # above) is already the per-class dice, averaged across test cases —
+    # one value per class val_single_volume iterated over. This codebase's
+    # val_single_volume follows the common convention of looping
+    # `for i in range(1, classes)`, i.e. skipping background (class 0), so
+    # class_idx below is labeled starting at 1 to match. If your
+    # val_single_volume includes background or orders classes differently,
+    # adjust the starting index/labels here accordingly.
+    per_class_dice = np.atleast_1d(metric_list)
+    logging.info('[TEST] Per-class dice breakdown:')
+    print('[TEST] Per-class dice breakdown:')
+    for i, class_dice in enumerate(per_class_dice, start=1):
+        logging.info('[TEST]   class_%d : %f' % (i, class_dice))
+        print('[TEST]   class_%d: %.4f' % (i, class_dice))
+        if writer is not None:
+            writer.add_scalar(f'test/dice_class_{i}', class_dice, iter_num)
+
+    if writer is not None:
+        writer.add_scalar('test/mean_dice', performance, iter_num)
+
+    results_path = os.path.join(snapshot_path, 'test_results.txt')
+    with open(results_path, 'w') as f:
+        f.write(f"checkpoint: {ckpt_path}\n")
+        f.write(f"split: {final_test_split_name}\n")
+        f.write(f"mean_dice: {performance:.6f}\n")
+        f.write("per_class_dice:\n")
+        for i, class_dice in enumerate(per_class_dice, start=1):
+            f.write(f"  class_{i}: {class_dice:.6f}\n")
+    logging.info(f"[TEST] Wrote final test results to {results_path}")
+
+    return performance
+
+
 def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=['add', 'mul', 'wf', 'concat'],
                      n_outs=4, use_learnable_weights=True, patience=30, min_delta=0.0):
     """
@@ -429,20 +514,34 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
 
     # Dispatch to the right dataset classes/kwargs based on args.dataset.
     # ACDC's classes take no nclass kwarg (unlike Synapse's 13->9 class
-    # remap) and its full-volume validation split is conventionally named
-    # "test" rather than Synapse's "test_vol" — adjust test_split_name here
-    # if your ACDC list files use a different name.
+    # remap). val_split_name is the split used for PER-EPOCH validation and
+    # checkpointing during training; final_test_split_name (if not None) is
+    # a genuinely held-out split only evaluated ONCE after training
+    # completes, on the best checkpoint.
+    #
+    # FIX: previously ACDC's per-epoch validation used split "test" — but
+    # your data has train/valid/test as three distinct splits, so that was
+    # silently using the held-out test set for validation every epoch (data
+    # leakage into model-selection decisions) while "valid" sat unused. Now
+    # "valid" is used for per-epoch validation, and "test" is reserved for
+    # the one-time final evaluation below. Synapse has no genuinely separate
+    # test split beyond test_vol (already used for validation), so
+    # final_test_split_name is None for it — the post-training test pass is
+    # skipped cleanly rather than just re-running the same validation split
+    # again under a different label.
     dataset_name = getattr(args, 'dataset', 'Synapse')
     if dataset_name == 'ACDC':
         train_dataset_cls = ACDC_preloaded_dataset
         test_dataset_cls = ACDCdataset
-        test_split_name = 'test'
+        val_split_name = 'valid'
+        final_test_split_name = 'test'
         train_kwargs = {}
         test_kwargs = {}
     else:
         train_dataset_cls = Synapse_preloaded_dataset
         test_dataset_cls = Synapse_dataset
-        test_split_name = 'test_vol'
+        val_split_name = 'test_vol'
+        final_test_split_name = None
         train_kwargs = {'nclass': args.num_classes}
         test_kwargs = {'nclass': args.num_classes}
 
@@ -469,7 +568,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                               persistent_workers=True, prefetch_factor=4, drop_last=is_distributed)
 
     if is_main_process(rank):
-        db_test = test_dataset_cls(base_dir=args.volume_path, split=test_split_name, list_dir=args.list_dir,
+        db_test = test_dataset_cls(base_dir=args.volume_path, split=val_split_name, list_dir=args.list_dir,
                                     **test_kwargs)
         testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     else:
@@ -522,10 +621,9 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         for p in combined.parameters():
             if p.requires_grad and p.dim() == 4 and p.shape[1] == 1:
                 p.register_hook(_force_canonical_grad_strides)
-        
-        find_unused_parameters = (supervision != 'lomix') 
+
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=find_unused_parameters)
+                        find_unused_parameters=False)
         raw = combined.module
     else:
         raw = combined
@@ -610,10 +708,6 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             iter_num += 1
 
             if is_main_process(rank):
-                if loss_module.use_learnable_weights:
-                    with torch.no_grad():
-                        for i, weight in enumerate(loss_module.original_weights):
-                            writer.add_scalar(f"weights/original_weight_{i}", weight.item(), iter_num)
                 writer.add_scalar('info/lr', lr_, iter_num)
                 writer.add_scalar('info/total_loss', loss, iter_num)
                 writer.add_scalar('info/deep_supervision_loss', deep_supervision_loss, iter_num)
@@ -624,6 +718,19 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                         'iteration %d, epoch %d : loss : %f, deep_supervision_loss : %f, mutation_loss : %f, lr: %f' % (
                             iter_num, epoch_num, loss.item(), deep_supervision_loss.item(),
                             mutation_loss.item(), lr_))
+
+                    # Log each combo's effective (post-softplus) learnable
+                    # weight so their evolution can be tracked in
+                    # TensorBoard. Throttled to the same cadence as the loss
+                    # log line above rather than every iteration, since
+                    # there are ~40+ of these and writing all of them every
+                    # single step would be a lot of redundant I/O.
+                    if raw.loss_module.use_learnable_weights:
+                        with torch.no_grad():
+                            for op, weights in raw.loss_module.synthesized_weights.items():
+                                for i, weight in enumerate(weights):
+                                    weight_val = F.softplus(weight).item()
+                                    writer.add_scalar(f"weights/weight_{op}_{i}", weight_val, iter_num)
 
         if is_main_process(rank):
             # Update the OUTER epoch bar's postfix with the last batch's
@@ -715,6 +822,24 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                 if hasattr(iterator, 'close'):
                     iterator.close()
             break
+
+    # FINAL TEST: run once, after the training loop ends (whether it ended
+    # via early stopping or reaching max_epochs), on the genuinely held-out
+    # test split — only when the dataset actually has one distinct from
+    # whatever was used for per-epoch validation (see final_test_split_name
+    # set up near the top of this function). Runs only on rank 0; other
+    # ranks wait at the barrier below so nothing tears down the process
+    # group while rank 0 is still evaluating.
+    if final_test_split_name is not None:
+        if is_main_process(rank):
+            run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
+                            final_test_split_name, writer, iter_num)
+        if is_distributed:
+            dist.barrier()
+    else:
+        if is_main_process(rank):
+            logging.info(f"[TEST] No separate held-out test split for dataset '{dataset_name}' "
+                          f"(its validation split already covers final evaluation); skipping.")
 
     if is_main_process(rank) and writer is not None:
         writer.close()
