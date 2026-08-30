@@ -522,9 +522,10 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         for p in combined.parameters():
             if p.requires_grad and p.dim() == 4 and p.shape[1] == 1:
                 p.register_hook(_force_canonical_grad_strides)
-
+        
+        find_unused_parameters = (supervision != 'lomix') 
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=False)
+                        find_unused_parameters=find_unused_parameters)
         raw = combined.module
     else:
         raw = combined
