@@ -188,10 +188,24 @@ class ACDCdataset(Dataset):
         # together — which per-epoch/final ACDC evaluation now does for
         # speed — makes torch.stack fail the moment two samples in the same
         # batch have different source dtypes ("input types can't be cast to
-        # the desired output type Byte"). Casting here guarantees every
-        # sample is uniform before it ever reaches collate.
-        image = np.asarray(data['img'], dtype=np.float32)
-        label = np.asarray(data['label'], dtype=np.int64)
+        # the desired output type Byte").
+        #
+        # IMPORTANT: use np.array(...), not np.asarray(...). np.asarray only
+        # copies when a dtype conversion is actually needed — if a given
+        # file's on-disk dtype already happens to match (float32/int64), it
+        # returns the array unchanged, still backed by numpy's internal
+        # npz-loading buffer rather than a normal standalone array. That
+        # buffer isn't resizable, and DataLoader worker processes try to
+        # resize a shared-memory buffer to fit a batch, which then fails
+        # with "Trying to resize storage that is not resizable" — this
+        # surfaced specifically on the "test" split (whose files happened to
+        # already be the target dtype) after "train"/"valid" worked fine
+        # (their files needed an actual conversion, which forces a copy
+        # incidentally). np.array(...) always copies by default regardless
+        # of whether a dtype conversion is needed, guaranteeing a genuine,
+        # independent, resizable array every time.
+        image = np.array(data['img'], dtype=np.float32)
+        label = np.array(data['label'], dtype=np.int64)
 
         sample = {'image': image, 'label': label}
         if self.transform and self.split == "train":
@@ -221,8 +235,8 @@ class ACDC_preloaded_dataset(Dataset):
             # uniform, regardless of what was stored on disk. This also
             # means we do the cast ONCE here rather than repeatedly in
             # __getitem__ (data is already in RAM after preloading).
-            image = np.asarray(data['img'], dtype=np.float32)
-            label = np.asarray(data['label'], dtype=np.int64)
+            image = np.array(data['img'], dtype=np.float32)
+            label = np.array(data['label'], dtype=np.int64)
 
             self.data_cache.append({
                 'image': image,
