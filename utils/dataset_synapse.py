@@ -154,21 +154,12 @@ class Synapse_preloaded_dataset(Dataset):
 # ==============================================================================
 # ACDC
 # ==============================================================================
-# On-disk layout differs from Synapse: train/valid slices live at
-# {base_dir}/{split}/{slice_name} (note: nested under a per-split
-# subdirectory, and slice_name from the list file is expected to already
-# include the .npz extension), with keys 'img'/'label' (not 'image'/'label').
-# Any other split value (e.g. a held-out volume split such as "test") is read
-# directly from {base_dir}/{vol_name}. ACDC's standard 4-class label set
-# (background, RV, myocardium, LV) needs no remapping, so there's no
-# nclass-driven special case here the way there is for Synapse.
-#
-# NOTE: verify the exact split name your ACDC list files use for full-volume
-# validation/test data (e.g. "test" vs "test_vol") and pass that split name
-# in when constructing these classes from trainer.py — the else-branch below
-# is written to be split-name-agnostic (anything that isn't "train"/"valid"
-# falls into it), so it works with whatever name you use as long as it's
-# consistent with your list_dir's .txt filename and the data's own layout.
+# On-disk layout differs from Synapse: all splits (train/valid/test) live
+# under {base_dir}/{split}/{filename} — e.g. base_dir/train/*.npz,
+# base_dir/valid/*.npz, base_dir/test/*.npz — with keys 'img'/'label' (not
+# 'image'/'label'). ACDC's standard 4-class label set (background, RV,
+# myocardium, LV) needs no remapping, so there's no nclass-driven special
+# case here the way there is for Synapse.
 
 class ACDCdataset(Dataset):
     def __init__(self, base_dir, list_dir, split, transform=None):
@@ -181,16 +172,26 @@ class ACDCdataset(Dataset):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        if self.split == "train" or self.split == "valid":
-            slice_name = self.sample_list[idx].strip('\n')
-            data_path = os.path.join(self.data_dir, self.split, slice_name)
-            data = np.load(data_path)
-            image, label = data['img'], data['label']
-        else:
-            vol_name = self.sample_list[idx].strip('\n')
-            filepath = os.path.join(self.data_dir, vol_name)
-            data = np.load(filepath)
-            image, label = data['img'], data['label']
+        # All splits (train/valid/test) live under {base_dir}/{split}/{filename},
+        # matching the on-disk layout: base_dir/{train,valid,test}/*.npz.
+        slice_name = self.sample_list[idx].strip('\n')
+        data_path = os.path.join(self.data_dir, self.split, slice_name)
+        data = np.load(data_path)
+        # FIX: cast to a fixed, known dtype regardless of what's stored on
+        # disk. Different ACDC .npz files can have inconsistent dtypes for
+        # 'img'/'label' (e.g. some saved as uint8, others as int64/float) —
+        # for the "train" split this was invisible because RandomGenerator's
+        # transform always casts to float32/long afterward, but valid/test
+        # skip that transform entirely, so raw (possibly mismatched) dtypes
+        # reached DataLoader's default_collate. With batch_size==1 that's
+        # harmless (nothing to reconcile), but batching multiple samples
+        # together — which per-epoch/final ACDC evaluation now does for
+        # speed — makes torch.stack fail the moment two samples in the same
+        # batch have different source dtypes ("input types can't be cast to
+        # the desired output type Byte"). Casting here guarantees every
+        # sample is uniform before it ever reaches collate.
+        image = np.asarray(data['img'], dtype=np.float32)
+        label = np.asarray(data['label'], dtype=np.int64)
 
         sample = {'image': image, 'label': label}
         if self.transform and self.split == "train":
@@ -211,14 +212,17 @@ class ACDC_preloaded_dataset(Dataset):
         self.data_cache = []
         for line in tqdm(sample_list, desc=f'Preloading ACDC {split} data', unit='sample'):
             case_name = line.strip('\n')
-            if split == "train" or split == "valid":
-                data_path = os.path.join(data_dir, split, case_name)
-            else:
-                data_path = os.path.join(data_dir, case_name)
+            # All splits (train/valid/test) live under {base_dir}/{split}/{filename}.
+            data_path = os.path.join(data_dir, split, case_name)
 
             data = np.load(data_path)
-            image = np.array(data['img'])
-            label = np.array(data['label'])
+            # FIX: same dtype-normalization reasoning as ACDCdataset above —
+            # cast to a fixed dtype at load time so every cached sample is
+            # uniform, regardless of what was stored on disk. This also
+            # means we do the cast ONCE here rather than repeatedly in
+            # __getitem__ (data is already in RAM after preloading).
+            image = np.asarray(data['img'], dtype=np.float32)
+            label = np.asarray(data['label'], dtype=np.int64)
 
             self.data_cache.append({
                 'image': image,
