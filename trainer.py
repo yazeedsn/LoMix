@@ -428,7 +428,15 @@ def evaluate_slices(args, model, best_performance, testloader, device, rank):
     denom = torch.zeros(num_classes, device=device)
 
     for sampled_batch in testloader:
-        image = sampled_batch["image"].to(device)
+        # FIX: ACDC's raw npz 'img' arrays load as float64 (numpy's default
+        # float dtype), which torch's default_collate preserves as a
+        # float64/double tensor. The model's conv weights are float32, so
+        # feeding a double tensor straight in raises "Input type (double)
+        # and bias type (float) should be the same". Synapse's path never
+        # hit this because RandomGenerator's transform explicitly casts to
+        # float32 — but no transform runs on non-train splits, so ACDC's
+        # raw validation/test slices reach here untouched.
+        image = sampled_batch["image"].to(device).float()
         label = sampled_batch["label"].to(device)
         # Defensive: handle either a bare 2D-slice batch [B,H,W] (ACDC's
         # actual format) or an already-channeled [B,C,H,W] batch, so this
@@ -516,7 +524,10 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
         intersect = torch.zeros(num_classes, device=device)
         denom = torch.zeros(num_classes, device=device)
         for sampled_batch in final_testloader:
-            image = sampled_batch["image"].to(device)
+            # See the matching comment in evaluate_slices() above — ACDC's
+            # raw npz slices load as float64; cast to float32 before the
+            # model's float32 conv weights see them.
+            image = sampled_batch["image"].to(device).float()
             label = sampled_batch["label"].to(device)
             if image.dim() == 3:
                 image = image.unsqueeze(1)
