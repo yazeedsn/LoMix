@@ -400,8 +400,68 @@ def inference(args, model, best_performance, db_test, testloader, device, rank):
 
 
 @torch.no_grad()
+def evaluate_slices(args, model, best_performance, testloader, device, rank):
+    """
+    Slice-wise 2D validation. Unlike inference() above (used for Synapse),
+    which reconstructs and evaluates whole 3D volumes via val_single_volume,
+    ACDC's valid/test splits in this repo are stored as individual 2D
+    slices — the same per-slice .npz convention as train, not multi-slice
+    volumes — so the volumetric path's `h, w = image.size()[2:]` fails
+    (only 3 dims present: [B, H, W], not 4).
+
+    Computes per-class Dice by pooling intersection/union across every
+    slice in the loader (global pooling, not per-slice-then-average), which
+    avoids divide-by-zero when a class is absent from an individual slice
+    and matches the common convention for 2D-slice segmentation Dice.
+
+    Returns (performance, per_class_dice) — per_class_dice is None on
+    non-main ranks (mirrors inference()'s rank-gating contract at the
+    per-epoch validation call site, which only unpacks `performance`).
+    """
+    if not is_main_process(rank):
+        return best_performance, None
+
+    logging.info("{} validation batches (slice-wise)".format(len(testloader)))
+    model.eval()
+    num_classes = args.num_classes
+    intersect = torch.zeros(num_classes, device=device)
+    denom = torch.zeros(num_classes, device=device)
+
+    for sampled_batch in testloader:
+        image = sampled_batch["image"].to(device)
+        label = sampled_batch["label"].to(device)
+        # Defensive: handle either a bare 2D-slice batch [B,H,W] (ACDC's
+        # actual format) or an already-channeled [B,C,H,W] batch, so this
+        # doesn't silently break if that assumption changes.
+        if image.dim() == 3:
+            image = image.unsqueeze(1)
+
+        outputs = model(image, mode='test')
+        pred_logits = outputs[-1] if isinstance(outputs, list) else outputs
+        pred = torch.argmax(torch.softmax(pred_logits, dim=1), dim=1)
+
+        for c in range(num_classes):
+            pred_c = (pred == c).float()
+            label_c = (label == c).float()
+            intersect[c] += (pred_c * label_c).sum()
+            denom[c] += pred_c.sum() + label_c.sum()
+
+    smooth = 1e-5
+    dice_per_class = ((2 * intersect + smooth) / (denom + smooth)).cpu().numpy()
+    # Exclude background (class 0) from the reported mean, matching the
+    # convention val_single_volume follows for Synapse.
+    per_class_dice = dice_per_class[1:] if num_classes > 1 else dice_per_class
+    performance = float(np.mean(per_class_dice))
+
+    logging.info('Testing performance in val model: mean_dice : %f, best_dice : %f' % (performance, best_performance))
+    print('[VAL] mean_dice: %.4f (best so far: %.4f)' % (performance, best_performance))
+    model.train()
+    return performance, per_class_dice
+
+
+@torch.no_grad()
 def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
-                    final_test_split_name, base_dir, writer, iter_num):
+                    final_test_split_name, base_dir, writer, iter_num, slicewise=False):
     """
     One-time evaluation on a genuinely held-out test split, run once after
     training finishes (not every epoch, unlike inference() above). Only
@@ -413,6 +473,11 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
     since ACDC's train/valid/test splits all live under ONE shared parent
     directory (base_dir/{train,valid,test}/...), unlike Synapse's convention
     of separate root_path (train) / volume_path (validation) directories.
+
+    slicewise=True switches to the same per-slice 2D evaluation used by
+    evaluate_slices() for per-epoch validation, instead of the volumetric
+    val_single_volume loop — needed for ACDC, whose test split (like train
+    and valid) is stored as individual 2D slices, not multi-slice volumes.
 
     Loads the BEST checkpoint (best.pth) before evaluating, since the model
     left in memory at the end of training holds the LAST epoch's weights,
@@ -438,33 +503,54 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
 
     db_final_test = test_dataset_cls(base_dir=base_dir, split=final_test_split_name,
                                       list_dir=args.list_dir, **test_kwargs)
-    final_testloader = DataLoader(db_final_test, batch_size=1, shuffle=False, num_workers=1)
+    # Slice-wise evaluation can batch many slices per forward pass; the
+    # volumetric path needs one whole volume (batch_size=1) per item.
+    final_test_batch_size = args.batch_size if slicewise else 1
+    final_testloader = DataLoader(db_final_test, batch_size=final_test_batch_size, shuffle=False, num_workers=1)
 
     logging.info(f"[TEST] {len(final_testloader)} final test iterations.")
     raw.model.eval()
-    metric_list = 0.0
-    for i_batch, sampled_batch in enumerate(final_testloader):
-        image, label = sampled_batch["image"], sampled_batch["label"]
-        case_name = sampled_batch['case_name'][0]
-        metric_i = val_single_volume(image, label, raw.model, classes=args.num_classes,
-                                      patch_size=[args.img_size, args.img_size],
-                                      case=case_name, z_spacing=args.z_spacing)
-        metric_list += np.array(metric_i)
-    metric_list = metric_list / len(db_final_test)
-    performance = np.mean(metric_list, axis=0)
+
+    if slicewise:
+        num_classes = args.num_classes
+        intersect = torch.zeros(num_classes, device=device)
+        denom = torch.zeros(num_classes, device=device)
+        for sampled_batch in final_testloader:
+            image = sampled_batch["image"].to(device)
+            label = sampled_batch["label"].to(device)
+            if image.dim() == 3:
+                image = image.unsqueeze(1)
+            outputs = raw.model(image, mode='test')
+            pred_logits = outputs[-1] if isinstance(outputs, list) else outputs
+            pred = torch.argmax(torch.softmax(pred_logits, dim=1), dim=1)
+            for c in range(num_classes):
+                pred_c = (pred == c).float()
+                label_c = (label == c).float()
+                intersect[c] += (pred_c * label_c).sum()
+                denom[c] += pred_c.sum() + label_c.sum()
+        smooth = 1e-5
+        dice_per_class_all = ((2 * intersect + smooth) / (denom + smooth)).cpu().numpy()
+        per_class_dice = dice_per_class_all[1:] if num_classes > 1 else dice_per_class_all
+        performance = float(np.mean(per_class_dice))
+    else:
+        metric_list = 0.0
+        for i_batch, sampled_batch in enumerate(final_testloader):
+            image, label = sampled_batch["image"], sampled_batch["label"]
+            case_name = sampled_batch['case_name'][0]
+            metric_i = val_single_volume(image, label, raw.model, classes=args.num_classes,
+                                          patch_size=[args.img_size, args.img_size],
+                                          case=case_name, z_spacing=args.z_spacing)
+            metric_list += np.array(metric_i)
+        metric_list = metric_list / len(db_final_test)
+        performance = np.mean(metric_list, axis=0)
+        # This codebase's val_single_volume follows the common convention
+        # of looping `for i in range(1, classes)`, i.e. skipping background
+        # (class 0) — matched below by labeling classes starting at 1.
+        per_class_dice = np.atleast_1d(metric_list)
 
     logging.info('[TEST] Final test performance: mean_dice : %f (checkpoint: %s)' % (performance, ckpt_path))
     print('[TEST] Final test mean_dice: %.4f (checkpoint: %s)' % (performance, ckpt_path))
 
-    # Per-class breakdown: metric_list (before the np.mean(axis=0) collapse
-    # above) is already the per-class dice, averaged across test cases —
-    # one value per class val_single_volume iterated over. This codebase's
-    # val_single_volume follows the common convention of looping
-    # `for i in range(1, classes)`, i.e. skipping background (class 0), so
-    # class_idx below is labeled starting at 1 to match. If your
-    # val_single_volume includes background or orders classes differently,
-    # adjust the starting index/labels here accordingly.
-    per_class_dice = np.atleast_1d(metric_list)
     logging.info('[TEST] Per-class dice breakdown:')
     print('[TEST] Per-class dice breakdown:')
     for i, class_dice in enumerate(per_class_dice, start=1):
@@ -584,7 +670,11 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     if is_main_process(rank):
         db_test = test_dataset_cls(base_dir=eval_base_dir, split=val_split_name, list_dir=args.list_dir,
                                     **test_kwargs)
-        testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
+        # Slice-wise validation (ACDC) can batch many 2D slices per forward
+        # pass; the volumetric path (Synapse) needs one whole volume
+        # (batch_size=1) per item.
+        val_batch_size = args.batch_size if dataset_name == 'ACDC' else 1
+        testloader = DataLoader(db_test, batch_size=val_batch_size, shuffle=False, num_workers=1)
     else:
         db_test, testloader = None, None
 
@@ -772,7 +862,10 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         if is_distributed:
             dist.barrier()
 
-        performance = inference(args, raw.model, best_performance, db_test, testloader, device, rank)
+        if dataset_name == 'ACDC':
+            performance, _ = evaluate_slices(args, raw.model, best_performance, testloader, device, rank)
+        else:
+            performance = inference(args, raw.model, best_performance, db_test, testloader, device, rank)
         prev_best = best_performance  # captured before checkpoint block below updates it, for early-stopping comparison
 
         if is_main_process(rank):
@@ -847,7 +940,8 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
     if final_test_split_name is not None:
         if is_main_process(rank):
             run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, test_kwargs,
-                            final_test_split_name, eval_base_dir, writer, iter_num)
+                            final_test_split_name, eval_base_dir, writer, iter_num,
+                            slicewise=(dataset_name == 'ACDC'))
         if is_distributed:
             dist.barrier()
     else:
