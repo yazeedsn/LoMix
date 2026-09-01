@@ -514,7 +514,7 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
     # Slice-wise evaluation can batch many slices per forward pass; the
     # volumetric path needs one whole volume (batch_size=1) per item.
     final_test_batch_size = args.batch_size if slicewise else 1
-    final_testloader = DataLoader(db_final_test, batch_size=final_test_batch_size, shuffle=False, num_workers=1)
+    final_testloader = DataLoader(db_final_test, batch_size=final_test_batch_size, shuffle=False, num_workers=0)
 
     logging.info(f"[TEST] {len(final_testloader)} final test iterations.")
     raw.model.eval()
