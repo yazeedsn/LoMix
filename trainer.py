@@ -737,8 +737,25 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
             if p.requires_grad and p.dim() == 4 and p.shape[1] == 1:
                 p.register_hook(_force_canonical_grad_strides)
 
+        # FIX: ModelWithLoss wraps BOTH `model` and `loss_module` into one
+        # DDP unit. When supervision is 'last_layer' (or any mode outside
+        # ['mutation','lomix','deep_supervision']), ModelWithLoss.forward's
+        # else-branch only uses P[-1] directly via ce_loss/dice_loss and
+        # never calls self.loss_module at all — so every parameter inside
+        # loss_module (combination weights, concat_convs,
+        # weighted_fusion_modules) gets no gradient that iteration. With
+        # find_unused_parameters=False (which assumes every wrapped
+        # parameter participates in every backward pass), DDP's bucket
+        # reduction never completes for those params, and the NEXT
+        # iteration's forward crashes with "Expected to have finished
+        # reduction in the prior iteration...". Only enable the (real, but
+        # modest) autograd-graph-traversal overhead of
+        # find_unused_parameters=True for supervision modes that actually
+        # need it — lomix/mutation/deep_supervision use every loss_module
+        # parameter every iteration, so they stay at the faster False.
+        needs_all_params = supervision in ['mutation', 'lomix', 'deep_supervision']
         combined = DDP(combined, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=False)
+                        find_unused_parameters=not needs_all_params)
         raw = combined.module
     else:
         raw = combined
