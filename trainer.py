@@ -511,14 +511,31 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
 
     db_final_test = test_dataset_cls(base_dir=base_dir, split=final_test_split_name,
                                       list_dir=args.list_dir, **test_kwargs)
-    # Slice-wise evaluation can batch many slices per forward pass; the
-    # volumetric path needs one whole volume (batch_size=1) per item.
-    final_testloader = DataLoader(db_final_test, batch_size=1, shuffle=False, num_workers=0)
+    # FIX: ACDC's "test" split turned out to be whole 3D volumes (variable
+    # slice count per patient), NOT individual 2D slices like train/valid —
+    # confirmed by a crash showing the raw batch as [1, 10, 224, 224], i.e.
+    # [batch=1, slices=10, H, W]. Since different volumes can have different
+    # slice counts, they can't be stacked into batch_size > 1 — batch_size
+    # must be 1 (one whole volume per item) regardless of args.batch_size,
+    # same as the Synapse volumetric path.
+    final_test_batch_size = 1
+    final_testloader = DataLoader(db_final_test, batch_size=final_test_batch_size, shuffle=False, num_workers=0)
 
     logging.info(f"[TEST] {len(final_testloader)} final test iterations.")
     raw.model.eval()
 
     if slicewise:
+        # "slicewise" here means "run the model per-2D-slice" (since the
+        # model only accepts 2D grayscale input), but each item from the
+        # loader is now a WHOLE VOLUME [1, S, H, W] (S = that volume's slice
+        # count, varies per item) rather than a flat batch of independent
+        # slices. Each volume's S slices are reshaped into their own
+        # mini-batch for the model's forward pass, then the resulting
+        # per-slice predictions are compared against that same volume's
+        # label slice-by-slice — i.e. Dice is still computed correctly at
+        # the individual-pixel level, just looping per volume instead of
+        # assuming a flat cross-file batch like evaluate_slices() does for
+        # the (genuinely flat, per-slice) "valid" split.
         num_classes = args.num_classes
         intersect = torch.zeros(num_classes, device=device)
         denom = torch.zeros(num_classes, device=device)
@@ -526,13 +543,24 @@ def run_final_test(args, raw, device, rank, snapshot_path, test_dataset_cls, tes
             # See the matching comment in evaluate_slices() above — ACDC's
             # raw npz slices load as float64; cast to float32 before the
             # model's float32 conv weights see them.
-            image = sampled_batch["image"].to(device).float()
-            label = sampled_batch["label"].to(device)
-            if image.dim() == 3:
-                image = image.unsqueeze(1)
+            image = sampled_batch["image"].to(device).float()  # [1, S, H, W]
+            label = sampled_batch["label"].to(device)          # [1, S, H, W]
+
+            image = image.squeeze(0)   # [S, H, W]
+            label = label.squeeze(0)   # [S, H, W]
+            if image.dim() == 2:
+                # Defensive: a "volume" with only 1 slice may have already
+                # lost its slice dim to squeeze(0); restore it.
+                image = image.unsqueeze(0)
+                label = label.unsqueeze(0)
+            image = image.unsqueeze(1)  # [S, 1, H, W] -- each slice becomes
+                                         # its own grayscale sample in a
+                                         # mini-batch for the model
+
             outputs = raw.model(image, mode='test')
-            pred_logits = outputs[-1] if isinstance(outputs, list) else outputs
-            pred = torch.argmax(torch.softmax(pred_logits, dim=1), dim=1)
+            pred_logits = outputs[-1] if isinstance(outputs, list) else outputs  # [S, num_classes, H, W]
+            pred = torch.argmax(torch.softmax(pred_logits, dim=1), dim=1)        # [S, H, W]
+
             for c in range(num_classes):
                 pred_c = (pred == c).float()
                 label_c = (label == c).float()
@@ -684,7 +712,15 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
         # pass; the volumetric path (Synapse) needs one whole volume
         # (batch_size=1) per item.
         val_batch_size = args.batch_size if dataset_name == 'ACDC' else 1
-        testloader = DataLoader(db_test, batch_size=val_batch_size, shuffle=False, num_workers=1)
+        # FIX: num_workers=0. DataLoader worker subprocesses collate via a
+        # freshly allocated shared-memory buffer, which failed with
+        # "Trying to resize storage that is not resizable" in this
+        # container environment once batching multiple samples together
+        # (which val_batch_size > 1 for ACDC does). num_workers=0 runs
+        # collation in the main process instead, avoiding that shared-memory
+        # path entirely — these evaluation loaders are small/infrequent
+        # enough that background prefetching isn't worth the crash risk.
+        testloader = DataLoader(db_test, batch_size=val_batch_size, shuffle=False, num_workers=0)
     else:
         db_test, testloader = None, None
 
