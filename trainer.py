@@ -966,7 +966,7 @@ def trainer_synapse(args, model, snapshot_path, supervision='lomix', operations=
                 epochs_no_improve += 1
                 logging.info(f"No improvement in mean_dice for {epochs_no_improve} epoch(s) (patience={patience}).")
             if epochs_no_improve >= patience:
-                stop_flag = 1
+                stop_flag = 0 # disable early stopping
                 logging.info(f"Early stopping triggered at epoch {epoch_num}: "
                               f"no mean_dice improvement for {patience} consecutive epochs.")
                 print(f"[EARLY STOP] No mean_dice improvement for {patience} epochs. "
